@@ -1,0 +1,6 @@
+first_column,fifth_last_column_mean
+arc.csv recall,0.31477097902097906
+ivy-2.0.csv recall,0.41655380485527543
+log4j-1.1.csv recall,0.6406701631701631
+redaktor.csv recall,0.4664735264735264
+synapse-1.1.csv recall,0.5545725156069983

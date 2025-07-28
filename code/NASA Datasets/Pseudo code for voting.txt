@@ -1,0 +1,37 @@
+// Train the base classifiers
+train_RF_classifier(training_data)
+train_SVM_classifier(training_data)
+train_NB_classifier(training_data)
+train_ANN_classifier(training_data)
+
+// Initialize class probabilities dictionary
+class_probabilities = {class_label: 0 for class_label in class_labels}
+
+// For each new data point
+for data_point in new_data:
+    // Make predictions using all base classifiers
+    RF_prediction = RF_classifier.predict_proba(data_point)
+    SVM_prediction = SVM_classifier.predict_proba(data_point)
+    NB_prediction = NB_classifier.predict_proba(data_point)
+    ANN_prediction = ANN_classifier.predict_proba(data_point)
+
+    // Calculate the soft voting predictions
+    for prediction, class_label in zip(RF_prediction, class_labels):
+        class_probabilities[class_label] += prediction[1]
+
+    for prediction, class_label in zip(SVM_prediction, class_labels):
+        class_probabilities[class_label] += prediction[1]
+
+    for prediction, class_label in zip(NB_prediction, class_labels):
+        class_probabilities[class_label] += prediction[1]
+
+    for prediction, class_label in zip(ANN_prediction, class_labels):
+        class_probabilities[class_label] += prediction[1]
+
+    // Identify the class with the highest probability or handle ties
+    predicted_class = handle_ties(class_probabilities)
+
+    // Output the predicted class
+    output(predicted_class)
+
+	
