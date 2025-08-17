@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from pandas.core.common import random_state
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import RobustScaler, QuantileTransformer
 from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
@@ -18,18 +19,7 @@ from sklearn.tree import DecisionTreeClassifier
 
 class DEFeatureSelector:
     def __init__(self, X, y, n_features, pop_size=30, max_iter=50, F=0.8, CR=0.9):
-        """
-        完整版差分进化特征选择器
-
-        参数:
-        X: 特征矩阵 (n_samples, n_features)
-        y: 目标向量 (n_samples,)
-        n_features: 原始特征数量
-        pop_size: 种群大小
-        max_iter: 最大迭代次数
-        F: 差分权重
-        CR: 交叉概率
-        """
+        """差分进化特征选择器"""
         self.X = X
         self.y = y
         self.n_features = n_features
@@ -39,13 +29,14 @@ class DEFeatureSelector:
         self.CR = CR
         self.best_fitness_history = []
         self.best_feature_set_history = []
+        self.best_solution_history = []
+        self.feature_weights = np.ones(n_features)  # 初始化所有特征权重为1
 
     def enhanced_objective(self, feature_mask):
         """多目标适应度函数"""
         selected_idx = np.where(feature_mask > 0.5)[0]
         if len(selected_idx) == 0:
             return 1000  # 惩罚空特征集
-
         X_sub = self.X[:, selected_idx]
         n_selected = len(selected_idx)
 
@@ -120,9 +111,12 @@ class DEFeatureSelector:
         # # 最终适应度 (最大化问题)
         # fitness = (0.5 * performance + 0.3 * relevance -
         #            0.4 * redundancy - 0.3 * complexity_penalty)
-        fitness = (0.6 * recall + 0.4 * performance + 0.3 * relevance - 0.2 * redundancy - 0.3 * complexity_penalty)
+        fitness = (0.4 * performance + 0.3 * relevance - 0.2 * redundancy - 0.3 * complexity_penalty)
+        # 更新特征权重
+        for idx in selected_idx:
+            self.feature_weights[idx] += fitness
 
-        return -fitness  # 最小化问题
+        return -fitness
 
     def evolve_generation(self, population):
         """执行完整的一代差分进化"""
@@ -163,7 +157,7 @@ class DEFeatureSelector:
 
     def optimize(self):
         """执行完整的差分进化优化"""
-        # 初始化种群 (连续向量)
+        # 初始化种群
         population = np.random.uniform(0, 1, (self.pop_size, self.n_features))
 
         # 记录初始最佳
@@ -195,7 +189,12 @@ class DEFeatureSelector:
 
         # 获取最优特征子集
         optimal_mask = best_solution > 0.5
-        return np.arange(self.n_features)[optimal_mask]
+        self.best_fitness_history.append(-best_fitness)
+        self.best_solution_history.append(best_solution)
+
+        # 返回所有特征的权重向量（长度为n_features）
+
+        return self.feature_weights
 
     def plot_evolution(self):
         """可视化进化过程"""
@@ -210,7 +209,7 @@ class DEFeatureSelector:
 
 
 class RASUSampler:
-    def __init__(self, features, target, risk_features=None):
+    def __init__(self, features, target,feature_weights, risk_features=None):
         """
         风险感知分层欠采样器
 
@@ -219,6 +218,7 @@ class RASUSampler:
         target: 目标Series
         risk_features: 风险特征列表
         """
+        self.feature_weights = feature_weights
         self.data = pd.concat([features, target], axis=1)
         self.target_name = target.name
         self.risk_features = risk_features if risk_features else features.columns.tolist()
@@ -227,40 +227,41 @@ class RASUSampler:
         self.feature_importance = None
 
     def precompute_risk_weights(self):
-        """预计算特征风险权重"""
-        # 训练简单模型获取特征重要性
-        X = self.data.drop(self.target_name, axis=1)
-        y = self.data[self.target_name]
-        # 使用KNN计算特征重要性
-        model = KNeighborsClassifier(n_neighbors=5, weights='distance')
-        model.fit(X, y)
-        # # 使用随机森林计算特征重要性（修改点）
-        # model = RandomForestClassifier(
-        #     n_estimators=100,
-        #     random_state=42,
-        #     n_jobs=-1
-        # )
-        # model.fit(X, y)
-        # # 获取特征重要性
-        # importances = model.feature_importances_
-        # self.feature_importance = dict(zip(X.columns, importances))
-        # 基于模型性能估计特征重要性
+        """使用传入的特征权重计算风险权重"""
+        # 确保feature_importance被初始化
         self.feature_importance = {}
-        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-        # baseline_score = np.mean(cross_val_score(model, X, y, cv=cv, scoring='recall'))
-        baseline_score = np.mean(cross_val_score(model, X, y, cv=cv, scoring='matthews_corrcoef'))
 
-        for feature in self.risk_features:
-            X_reduced = X.drop(feature, axis=1)
-            reduced_score = np.mean(cross_val_score(model, X_reduced, y, cv=cv, scoring='matthews_corrcoef'))
-            importance = max(0, baseline_score - reduced_score)  # 特征删除导致性能下降的程度
-            self.feature_importance[feature] = importance
+        # 如果已传入feature_weights，直接使用
+        if hasattr(self, 'feature_weights') and self.feature_weights is not None:
+            total_weight = np.sum(np.abs(self.feature_weights))
+            for i, feature in enumerate(self.risk_features):
+                if total_weight > 0:
+                    self.feature_importance[feature] = self.feature_weights[i] / total_weight
+                else:
+                    self.feature_importance[feature] = 0
+            print("Using precomputed feature weights from differential evolution")
+        #     return
+        #
+        # # 备用方法：使用KNN计算特征重要性（当没有传入权重时）
+        # print("Computing feature importance with KNN (fallback)")
+        # X = self.data.drop(self.target_name, axis=1)
+        # y = self.data[self.target_name]
+        #
+        # model = KNeighborsClassifier(n_neighbors=5, weights='distance')
+        # cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        # baseline_score = np.mean(cross_val_score(model, X, y, cv=cv, scoring='matthews_corrcoef'))
+        #
+        # for feature in self.risk_features:
+        #     X_reduced = X.drop(feature, axis=1)
+        #     reduced_score = np.mean(cross_val_score(model, X_reduced, y, cv=cv, scoring='matthews_corrcoef'))
+        #     importance = max(0, baseline_score - reduced_score)
+        #     self.feature_importance[feature] = importance
 
-        # 归一化特征重要性
-        total = sum(self.feature_importance.values())
-        for feature in self.feature_importance:
-            if total > 0:
-                self.feature_importance[feature] /= total
+        # 归一化
+        total_importance = sum(self.feature_importance.values())
+        if total_importance > 0:
+            for feature in self.feature_importance:
+                self.feature_importance[feature] /= total_importance
 
         # 计算每个特征的风险权重
         self.risk_weights = {}
@@ -285,8 +286,8 @@ class RASUSampler:
 
     def adaptive_sampling(self):
         """Perform adaptive stratified sampling."""
-        if not hasattr(self, 'risk_weights'):
-            self.precompute_risk_weights()
+
+        self.precompute_risk_weights()
 
         # Calculate the overall risk score for each sample
         self.data['risk_score'] = 0.0  # Initialize as float
@@ -537,13 +538,7 @@ def preprocess_data(X, y):
 
 def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20):
     """
-    DE-RASU完整工作流程
-
-    参数:
-    file_path: CSV文件路径
-    target_column: 目标列名称
-    n_iter: 差分进化迭代次数
-    pop_size: 种群大小
+    DE-RASU完整工作流程（不进行特征选择）
     """
     # 1. 从CSV文件加载数据
     print(f"Loading data from {file_path}...")
@@ -581,25 +576,54 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20):
     X = X.apply(pd.to_numeric, errors='coerce')
     X_preprocessed, y = preprocess_data(X, y)
 
-    # 3. 差分进化特征选择
-    print("\nStarting Differential Evolution Feature Selection...")
-    selector = DEFeatureSelector(X_preprocessed.values, y.values,
-                                 n_features=X_preprocessed.shape[1],
-                                 max_iter=n_iter, pop_size=pop_size)
-    optimal_features_idx = selector.optimize()
-    optimal_features = X_preprocessed.columns[optimal_features_idx]
-    print(f"\nSelected {len(optimal_features)} features: {optimal_features.tolist()}")
+    # ==== 关键修改1: 跳过特征选择，使用所有特征 ====
+    print("\nSkipping feature selection, using all features...")
+    all_features = X_preprocessed.columns.tolist()
+    # 3. 差分进化特征选择（获取特征权重）
+    print("\nStarting Differential Evolution Feature Selection for feature importance...")
+    selector = DEFeatureSelector(
+        X_preprocessed.values,
+        y.values,
+        n_features=X_preprocessed.shape[1],
+        pop_size=pop_size,
+        max_iter=n_iter,
+    )
+
+    # 获取特征权重向量（应该是长度为特征数量的数组）
+    feature_weights = selector.optimize()
+
+    # 创建特征重要性DataFrame
+    feature_importance = pd.DataFrame({
+        'Feature': X_preprocessed.columns[:len(feature_weights)],  # 确保长度一致
+        'Weight': feature_weights
+    }).sort_values('Weight', ascending=False)
+
+    print("\nTop 10 Feature Weights:")
+    print(feature_importance.head(10))
+
+    # 可视化特征重要性
+    plt.figure(figsize=(12, 8))
+    sns.barplot(x='Weight', y='Feature', data=feature_importance.head(20))
+    plt.title('Top 20 Feature Weights')
+    plt.tight_layout()
+    plt.savefig('feature_importance.png')
+    plt.show()
 
     # 可视化进化过程
     selector.plot_evolution()
 
-    # 4. 风险感知分层欠采样
-    print("\nPerforming Risk-Aware Stratified Undersampling...")
-    rasu = RASUSampler(X_preprocessed[optimal_features], y)
+    # 4. 风险感知分层欠采样（使用所有特征和特征重要性）
+    print("\nPerforming Risk-Aware Stratified Undersampling with all features...")
+    rasu = RASUSampler(
+        features=X_preprocessed,  # 使用所有特征
+        target=y,  # 目标变量
+        feature_weights=feature_weights,  # 使用差分进化得到的特征权重
+        risk_features=X_preprocessed.columns.tolist()  # 所有特征都用于风险计算
+    )
     balanced_data = rasu.adaptive_sampling()
 
     # 5. 可视化分布变化
-    for feature in optimal_features[:min(3, len(optimal_features))]:  # 可视化前3个特征
+    for feature in all_features[:min(3, len(all_features))]:  # 可视化前3个特征
         rasu.plot_distribution_comparison(X_preprocessed, balanced_data, feature)
 
     # 6. 训练最终模型
@@ -629,14 +653,13 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20):
 
     # 6. 训练最终模型
     print("\nTraining Final Model with Random Forest...")
-    # 使用更强大的随机森林分类器
     model = RandomForestClassifier(
         n_estimators=100,
         random_state=42,
         class_weight='balanced',
         n_jobs=-1
     )
-    # model =DecisionTreeClassifier();
+
     # 训练模型
     model.fit(X_train, y_train)
 
@@ -659,12 +682,13 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20):
 
     print("\nModel Evaluation:")
     print(f"AUC-PR: {metrics['auc_pr']:.4f}")
-    # print(f"ROC-AUC: {metrics['roc_auc']:.4f}")
     print(f"Precision: {metrics['precision']:.4f}")
     print(f"Recall: {metrics['recall']:.4f}")
     print(f"F1-Score: {metrics['f1']:.4f}")
     print(f"MCC: {metrics['mcc']:.4f}")  # 打印MCC值
-    print(f"AUC: {metrics['roc_auc']:.4f}")
+    print(f"ROC-AUC: {metrics['roc_auc']:.4f}")
+
+    # 绘制混淆矩阵
     plt.figure(figsize=(8, 6))
     sns.heatmap(metrics['confusion_matrix'], annot=True, fmt='d', cmap='Blues',
                 xticklabels=['Normal', 'Defect'], yticklabels=['Normal', 'Defect'])
@@ -674,16 +698,13 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20):
     plt.savefig('confusion_matrix.png')
     plt.show()
 
-    # 在 DE_RASU_pipeline 函数中找到决策边界可视化部分，修改为：
-
-    # 8. KNN没有特征重要性，但我们可以绘制决策边界
-    # 选择一个特征对进行可视化
-    if len(optimal_features) >= 2:
+    # 8. 决策边界可视化（如果特征数>=2）
+    if len(all_features) >= 2:
         print("\nVisualizing decision boundary for top 2 features...")
         plt.figure(figsize=(10, 8))
 
         # 使用前两个特征
-        selected_feat1, selected_feat2 = optimal_features[:2]
+        selected_feat1, selected_feat2 = all_features[:2]
 
         # 创建网格点
         x_min, x_max = X_bal[selected_feat1].min() - 1, X_bal[selected_feat1].max() + 1
@@ -699,11 +720,11 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20):
         })
 
         # 为其他特征添加中位数
-        for feat in optimal_features[2:]:
+        for feat in all_features[2:]:
             grid_data[feat] = X_bal[feat].median()
 
         # 确保特征顺序与训练数据一致
-        grid_data = grid_data[optimal_features]
+        grid_data = grid_data[all_features]
 
         # 预测网格点
         Z = model.predict_proba(grid_data)[:, 1]
@@ -719,24 +740,16 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20):
         plt.title('Decision Boundary Visualization')
         plt.xlabel(selected_feat1)
         plt.ylabel(selected_feat2)
-        plt.savefig('knn_decision_boundary.png')
+        plt.savefig('decision_boundary.png')
         plt.show()
 
     # 9. 保存结果
     result = {
         'model': model,
-        'selected_features': optimal_features.tolist(),
+        'selected_features': all_features,
         'metrics': metrics,
         'sampled_data': balanced_data
     }
-
-    # 保存特征选择历史
-    feature_history = pd.DataFrame({
-        'generation': range(len(selector.best_feature_set_history)),
-        'fitness': selector.best_fitness_history,
-        'num_features': [len(feats) for feats in selector.best_feature_set_history]
-    })
-    feature_history.to_csv('de_feature_history.csv', index=False)
 
     return result
 
@@ -746,7 +759,7 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20):
 # ======================
 if __name__ == "__main__":
     # 从CSV文件加载真实数据
-    data_path = r"G:\pycharm\lutrs\stability-of-smote-main\AEEM\converted_PDE.csv"  # 使用原始字符串
+    data_path = r"G:\pycharm\lutrs\de分层欠采样\datacunshu\arc.csv"  # 使用原始字符串
 
     # 运行DE-RASU管道
     results = DE_RASU_pipeline(file_path=data_path,

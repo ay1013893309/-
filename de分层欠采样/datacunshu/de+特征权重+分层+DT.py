@@ -164,16 +164,7 @@ class DEFeatureSelector:
 
 class RASUSampler:
     def __init__(self, features, target, feature_weights, risk_features=None, random_state=42):
-        """
-        风险感知分层欠采样器
-
-        参数:
-        features: 特征DataFrame
-        target: 目标Series
-        feature_weights: 特征权重向量
-        risk_features: 风险特征列表
-        random_state: 随机种子
-        """
+        # 修复1: 正确初始化self.data
         self.data = pd.concat([features, target], axis=1)
         self.target_name = target.name
         self.feature_weights = feature_weights
@@ -182,15 +173,12 @@ class RASUSampler:
         np.random.seed(random_state)
         self.majority_class = 0
         self.minority_class = 1
-        self.feature_importance = {}  # 初始化为空字典
-        self.risk_weights = None
+        self.feature_importance = {}
+        self.risk_weights = {}
+        self.bin_columns = {}  # 存储分箱列名
 
     def precompute_risk_weights(self):
         """使用传入的特征权重计算风险权重"""
-        # 确保 feature_importance 被初始化
-        if not hasattr(self, 'feature_importance') or self.feature_importance is None:
-            self.feature_importance = {}
-
         # 归一化特征重要性
         total_weight = np.sum(np.abs(self.feature_weights))
         for i, feature in enumerate(self.risk_features):
@@ -200,49 +188,60 @@ class RASUSampler:
                 self.feature_importance[feature] = 0
 
         # 计算每个特征的风险权重
-        self.risk_weights = {}
         for feature in self.risk_features:
             try:
                 # 检查特征是否有足够的值进行分箱
                 unique_values = self.data[feature].nunique()
                 if unique_values < 2:
-                    print(f"Warning: Feature {feature} has only {unique_values} unique values. Skipping binning.")
-                    self.risk_weights[feature] = {None: self.feature_importance[feature]}
+                    print(f"Warning: Feature {feature} has only {unique_values} unique values. Using constant weight.")
+                    self.risk_weights[feature] = {'constant': self.feature_importance[feature]}
                     continue
 
-                # 尝试分箱 - 使用更健壮的方法
+                # 尝试分箱
+                bin_col_name = f'{feature}_bin'
                 try:
                     # 尝试分5箱
-                    self.data[f'{feature}_bin'], bins = pd.qcut(
+                    self.data[bin_col_name], bins = pd.qcut(
                         self.data[feature],
                         q=5,
                         duplicates='drop',
                         retbins=True
                     )
-                except ValueError:
+                    self.bin_columns[feature] = bin_col_name
+                except ValueError as e:
+                    print(f"Warning: Standard binning failed for {feature}: {str(e)}")
                     # 如果5箱失败，尝试更少的分箱
                     n_bins = min(5, unique_values)
                     if n_bins < 2:
                         n_bins = 2
-                    self.data[f'{feature}_bin'], bins = pd.qcut(
-                        self.data[feature],
-                        q=n_bins,
-                        duplicates='drop',
-                        retbins=True
-                    )
+                    try:
+                        self.data[bin_col_name], bins = pd.qcut(
+                            self.data[feature],
+                            q=n_bins,
+                            duplicates='drop',
+                            retbins=True
+                        )
+                        self.bin_columns[feature] = bin_col_name
+                    except Exception as e2:
+                        print(f"Error: Fallback binning failed for {feature}: {str(e2)}")
+                        self.risk_weights[feature] = {'constant': self.feature_importance[feature]}
+                        continue
 
                 # 计算每个箱的缺陷率
-                bin_stats = self.data.groupby(f'{feature}_bin')[self.target_name].agg(['mean', 'count'])
+                bin_stats = self.data.groupby(bin_col_name)[self.target_name].agg(['mean', 'count'])
                 bin_stats['defect_ratio'] = bin_stats['mean']
 
                 # 使用Sigmoid函数计算权重
                 bin_stats['weight'] = 1 / (1 + np.exp(-20 * (bin_stats['defect_ratio'] - 0.3))) * \
                                       self.feature_importance[feature]
+
+                # 转换为字典存储
                 self.risk_weights[feature] = bin_stats['weight'].to_dict()
+
             except Exception as e:
-                print(f"Warning: Failed to compute risk weights for feature {feature}: {str(e)}")
+                print(f"Critical error computing risk weights for {feature}: {str(e)}")
                 # 如果失败，使用特征重要性作为默认权重
-                self.risk_weights[feature] = {None: self.feature_importance[feature]}
+                self.risk_weights[feature] = {'constant': self.feature_importance[feature]}
 
     def adaptive_sampling(self):
         """执行自适应分层抽样"""
@@ -261,7 +260,23 @@ class RASUSampler:
             if bin_col in self.data.columns:
                 # 确保 risk_weights 存在
                 if hasattr(self, 'risk_weights') and feature in self.risk_weights:
-                    weights = self.data[bin_col].map(self.risk_weights[feature]).fillna(0).astype(float)
+                    # 修复：正确处理分类变量
+                    if pd.api.types.is_categorical_dtype(self.data[bin_col]):
+                        # 获取分类变量的类别
+                        categories = self.data[bin_col].cat.categories
+
+                        # 创建映射字典，确保所有类别都有对应的权重
+                        weight_dict = {}
+                        for cat in categories:
+                            if cat in self.risk_weights[feature]:
+                                weight_dict[cat] = self.risk_weights[feature][cat]
+                            else:
+                                # 如果类别没有权重，使用0
+                                weight_dict[cat] = 0
+
+                        weights = self.data[bin_col].map(weight_dict)
+                    else:
+                        weights = self.data[bin_col].map(self.risk_weights[feature]).fillna(0).astype(float)
                 else:
                     weights = pd.Series(0, index=self.data.index)
                     print(f"Warning: Risk weights not found for feature {feature}")
@@ -400,21 +415,55 @@ class RASUSampler:
         plt.show()
 
 
-def preprocess_data(X, y):
+def preprocess_data(X, y, use_fitted=False, imputer=None, transformers=None, scaler=None):
     """数据预处理"""
-    imputer = SimpleImputer(strategy='median')
-    X_imputed = pd.DataFrame(imputer.fit_transform(X), columns=X.columns)
+    if not use_fitted:
+        # 第一次调用，创建预处理对象
+        print("Preprocessing training data...")
 
-    skewed_features = X_imputed.apply(lambda x: abs(x.skew()) > 0.75)
-    for feat in skewed_features[skewed_features].index:
-        n_samples = len(X_imputed)
-        n_quantiles = min(1000, max(10, n_samples // 2))
-        qt = QuantileTransformer(n_quantiles=n_quantiles, output_distribution='normal')
-        X_imputed[feat] = qt.fit_transform(X_imputed[[feat]])
+        # 1. 处理缺失值
+        imputer = SimpleImputer(strategy='median')
+        X_imputed = pd.DataFrame(imputer.fit_transform(X), columns=X.columns)
 
-    scaler = RobustScaler()
-    X_scaled = pd.DataFrame(scaler.fit_transform(X_imputed), columns=X_imputed.columns)
-    return X_scaled, y
+        # 2. 识别偏斜特征
+        skewed_features = X_imputed.apply(lambda x: abs(x.skew()) > 0.75)
+        transformers = {}
+
+        # 3. 处理偏斜特征
+        for feat in skewed_features[skewed_features].index:
+            print(f"  - Transforming skewed feature: {feat}")
+            n_samples = len(X_imputed)
+            n_quantiles = min(1000, max(10, n_samples // 2))
+            qt = QuantileTransformer(n_quantiles=n_quantiles, output_distribution='normal')
+            X_imputed[feat] = qt.fit_transform(X_imputed[[feat]])
+            transformers[feat] = qt
+
+        # 4. 缩放
+        scaler = RobustScaler()
+        X_scaled = pd.DataFrame(scaler.fit_transform(X_imputed), columns=X_imputed.columns)
+
+        return X_scaled, y, imputer, transformers, scaler
+    else:
+        print("Preprocessing test data with fitted transformers...")
+
+        # 1. 使用已拟合的imputer处理缺失值
+        X_imputed = pd.DataFrame(imputer.transform(X), columns=X.columns)
+
+        # 2. 应用偏斜特征转换
+        for feat, transformer in transformers.items():
+            if feat in X_imputed.columns:
+                print(f"  - Applying transformation to feature: {feat}")
+                # 确保转换器已拟合
+                if not hasattr(transformer, 'n_quantiles_'):
+                    print(f"Warning: Transformer for {feat} not fitted! Refitting...")
+                    # 紧急修复：重新拟合转换器
+                    transformer.fit(X_imputed[[feat]])
+                X_imputed[feat] = transformer.transform(X_imputed[[feat]])
+
+        # 3. 应用缩放
+        X_scaled = pd.DataFrame(scaler.transform(X_imputed), columns=X_imputed.columns)
+
+        return X_scaled, y
 
 
 def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20, random_state=42):
@@ -448,6 +497,16 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20, ran
     # 将目标变量转换为二分类
     y = y.apply(lambda x: 1 if x > 0 else 0)
 
+    # ==============================================
+    # 关键修改1：先分割训练集和测试集（测试集全程不参与特征选择/采样）
+    # ==============================================
+    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+        X, y,
+        test_size=0.2,
+        stratify=y,  # 保持分层，确保类别比例一致
+        random_state=random_state  # 固定随机种子，保证可复现
+    )
+
     # 输出类分布
     class_counts = y.value_counts()
     print(f"Class distribution:\n{class_counts}")
@@ -455,17 +514,31 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20, ran
         defect_rate = class_counts[1] / class_counts.sum()
         print(f"Defect rate: {defect_rate:.2%}")
 
-    # 数据预处理
-    print("\nPreprocessing data...")
-    X = X.apply(pd.to_numeric, errors='coerce')
-    X_preprocessed, y = preprocess_data(X, y)
+    # ==== 新增: 可视化预处理前的原始分布 ====
+    visualize_original_distributions(X)  # <--- 添加这行
 
-    # 差分进化特征选择
+    # 关键修改1: 仅在训练集上拟合预处理器
+    print("\nPreprocessing data...")
+
+    # 预处理训练集
+    print("\nPreprocessing training data...")
+    X_train_prep, y_train, imputer, transformers, scaler = preprocess_data(X_train_raw, y_train)
+
+    # 预处理测试集（使用训练集的参数）
+    print("\nPreprocessing test data...")
+    X_test_prep, y_test = preprocess_data(X_test_raw, y_test, use_fitted=True,
+                                          imputer=imputer, transformers=transformers, scaler=scaler)
+
+    # 对测试集应用相同的预处理
+    imputer = SimpleImputer(strategy='median')
+    X_test_imputed = pd.DataFrame(imputer.fit_transform(X_test_raw), columns=X_test_raw.columns)
+
+    # 关键修改2: 只在训练集上进行特征选择
     print("\nStarting Differential Evolution Feature Selection...")
     selector = DEFeatureSelector(
-        X_preprocessed.values,
-        y.values,
-        n_features=X_preprocessed.shape[1],
+        X_train_prep.values,  # 只使用训练集
+        y_train.values,  # 只使用训练集
+        n_features=X_train_prep.shape[1],
         max_iter=n_iter,
         pop_size=pop_size,
         random_state=random_state
@@ -476,7 +549,7 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20, ran
 
     # 可视化特征重要性
     feature_importance = pd.DataFrame({
-        'Feature': X_preprocessed.columns,
+        'Feature': X_train_prep.columns,
         'Weight': feature_weights
     }).sort_values('Weight', ascending=False)
 
@@ -495,17 +568,20 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20, ran
 
     # 风险感知分层欠采样
     print("\nPerforming Risk-Aware Stratified Undersampling...")
+    # 关键修改3: 只在训练集上进行欠采样
+    print("\nPerforming Risk-Aware Stratified Undersampling...")
     rasu = RASUSampler(
-        X_preprocessed,
-        y,
+        X_train_prep,  # 训练集特征
+        y_train,  # 训练集目标
         feature_weights=feature_weights,
         random_state=random_state
     )
     balanced_data = rasu.adaptive_sampling()
+    balanced_data = rasu.adaptive_sampling()
 
     # 可视化分布变化
-    for feature in X_preprocessed.columns[:min(3, len(X_preprocessed.columns))]:
-        rasu.plot_distribution_comparison(X_preprocessed, balanced_data, feature)
+    for feature in X_train_prep.columns[:min(3, len(X_train_prep.columns))]:
+        rasu.plot_distribution_comparison(X_train_prep, balanced_data, feature)
 
     # 准备训练数据
     X_bal = balanced_data.drop(columns=[rasu.target_name, 'risk_score', 'risk_bin'], errors='ignore')
@@ -550,11 +626,11 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20, ran
     sample_weights = (sample_weights - sample_weights.min()) / (sample_weights.max() - sample_weights.min() + 1e-10)
     sample_weights = sample_weights * 0.5 + 0.5  # 调整到0.5-1.0范围
 
-    model.fit(X_train, y_train, sample_weight=sample_weights)
+    model.fit(X_train_prep, y_train, sample_weight=sample_weights)
 
     # 评估模型
-    y_pred = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1]
+    y_pred = model.predict(X_test_prep)
+    y_proba = model.predict_proba(X_test_prep)[:, 1]
 
     metrics = {
         'auc_pr': average_precision_score(y_test, y_proba),
@@ -644,12 +720,49 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20, ran
     return result
 
 
+def visualize_original_distributions(X, max_features=5):
+    """
+    可视化原始数据分布（预处理前）
+
+    参数:
+    X: 原始特征DataFrame
+    max_features: 最多展示的特征数量
+    """
+    print("\nVisualizing original distributions...")
+    features = X.columns[:min(len(X.columns), max_features)]
+
+    for feature in features:
+        plt.figure(figsize=(10, 6))
+        sns.histplot(X[feature], kde=True, stat='density', color='skyblue', alpha=0.7)
+
+        # 计算关键统计量
+        skewness = X[feature].skew()
+        kurtosis = X[feature].kurtosis()
+
+        plt.title(f'Original Distribution: {feature}\n'
+                  f'Skewness: {skewness:.2f}, Kurtosis: {kurtosis:.2f}')
+        plt.xlabel(feature)
+        plt.ylabel('Density')
+
+        # 添加统计信息注释
+        stats_text = (f"Min: {X[feature].min():.2f}\n"
+                      f"Max: {X[feature].max():.2f}\n"
+                      f"Std: {X[feature].std():.2f}\n"
+                      f"25%: {X[feature].quantile(0.25):.2f}\n"
+                      f"75%: {X[feature].quantile(0.75):.2f}")
+        plt.annotate(stats_text, xy=(0.05, 0.8), xycoords='axes fraction',
+                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
+
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f'original_distribution_{feature}.png')
+        plt.close()
 # ======================
 # 使用示例
 # ======================
 if __name__ == "__main__":
     # 从CSV文件加载真实数据
-    data_path = r"G:\pycharm\lutrs\de分层欠采样\datacunshu\ant-1.4.csv"
+    data_path = r"G:\pycharm\lutrs\de分层欠采样\datacunshu\ant-1.3.csv"
     random_seed = 42
 
     # 运行DE-RASU管道
