@@ -223,7 +223,7 @@ def plot_metrics_vs_threshold(model, X_test, y_test):
 
 # 加载数据
 def load_data():
-    df = pd.read_csv(r"G:\pycharm\lutrs\stability-of-smote-main\AEEM\converted_PDE.csv")
+    df = pd.read_csv(r"D:\-\de分层欠采样\datacunshu\arc.csv")
     y_raw = df['bug'].values
     y = (y_raw > 0).astype(int)
     df = df.drop(columns=['name', 'version', 'name1', 'bug'], errors='ignore')
@@ -254,14 +254,15 @@ def main():
     print("原始训练集类别分布:", {label: sum(y_train == label) for label in np.unique(y_train)})
 
     # 3. 使用SMOTE过采样少数类
-    smote = MC_NCLWO(
+    smote1 = MC_NCLWO(
         max_weight_percentile=95,  # 最大权重百分位
         clear_ratio=50,  # 清除噪声的比例
         alpha=0.5,  # 热度衰减系数
         p_norm=2,  # 距离的 p 范数
         verbose=True  # 是否打印详细信息
     )
-    X_res, y_res = smote.fit_sample(X_train, y_train)
+    smote = SMOTE(random_state=47);
+    X_res, y_res = smote.fit_resample(X_train, y_train)
 
     print("SMOTE后训练集类别分布:", {label: sum(y_res == label) for label in np.unique(y_res)})
 

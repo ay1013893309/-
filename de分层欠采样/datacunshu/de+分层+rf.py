@@ -120,7 +120,7 @@ class DEFeatureSelector:
         # # 最终适应度 (最大化问题)
         # fitness = (0.5 * performance + 0.3 * relevance -
         #            0.4 * redundancy - 0.3 * complexity_penalty)
-        fitness = (0.6 * recall + 0.4 * performance + 0.3 * relevance - 0.2 * redundancy - 0.3 * complexity_penalty)
+        fitness = (0.4 * performance + 0.3 * relevance - 0.2 * redundancy)
 
         return -fitness  # 最小化问题
 
@@ -557,13 +557,13 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20):
     # 删除前三列标识信息列
     if data.shape[1] > 3:  # 确保有足够的列
         # 保留特征列（从第3列开始到倒数第二列）和目标列（最后一列）
-        feature_columns = data.columns[3:-1]
+        feature_columns = data.columns[0:-1]
         target_column = data.columns[-1]
 
         X = data[feature_columns]
         y = data[target_column]
-    else:
-        raise ValueError("CSV文件列数不足，请检查数据格式")
+    # else:
+    #     raise ValueError("CSV文件列数不足，请检查数据格式")
 
     # 将目标变量转换为二分类：大于0表示有缺陷（1），等于0表示无缺陷（0）
     y = y.apply(lambda x: 1 if x > 0 else 0)
@@ -746,11 +746,11 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20):
 # ======================
 if __name__ == "__main__":
     # 从CSV文件加载真实数据
-    data_path = r"G:\pycharm\lutrs\stability-of-smote-main\AEEM\converted_PDE.csv"  # 使用原始字符串
+    data_path = r"D:\-\de分层欠采样\datacunshu\Log4j-1.1.csv"  # 使用原始字符串
 
     # 运行DE-RASU管道
     results = DE_RASU_pipeline(file_path=data_path,
-                               n_iter=20,
+                               n_iter=30,
                                pop_size=15)
 
     if results:

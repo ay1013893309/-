@@ -6,7 +6,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import RobustScaler, QuantileTransformer
 from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.metrics import average_precision_score, roc_auc_score, f1_score, recall_score, precision_score, \
-    confusion_matrix
+    confusion_matrix, make_scorer
 from sklearn.neighbors import KNeighborsClassifier
 import seaborn as sns
 import os
@@ -50,12 +50,23 @@ class DEFeatureSelector:
                 n_jobs=-1  # 使用所有CPU核心
             )
 
-            # 使用分层交叉验证
-            # 检查是否是二分类问题
+            # 在cross_val_score前添加：
             if len(np.unique(self.y)) == 2:
-                scoring = 'average_precision'
+                defect_ratio = np.mean(self.y == 1)
+
+                if defect_ratio < 0.15:  # 高度不平衡
+                    scoring = make_scorer(lambda y_true, y_pred:
+                                          recall_score(y_true, y_pred) * 0.7 +
+                                          f1_score(y_true, y_pred) * 0.3)
+                else:  # 相对平衡
+                    scoring = make_scorer(lambda y_true, y_pred:
+                                          matthews_corrcoef(y_true, y_pred) * 0.6 +
+                                          average_precision_score(y_true, y_pred) * 0.4)
             else:
-                scoring = 'roc_auc_ovr'  # 多分类使用ROC-AUC
+                scoring = make_scorer(lambda y_true, y_pred:
+                                      f1_score(y_true, y_pred, average='weighted') * 0.5 +
+                                      recall_score(y_true, y_pred, average='macro') * 0.3 +
+                                      roc_auc_score(y_true, y_pred, multi_class='ovo') * 0.2)
 
             # 根据样本量动态设置交叉验证折数
             min_class_size = min(np.bincount(self.y))
@@ -111,7 +122,7 @@ class DEFeatureSelector:
         # # 最终适应度 (最大化问题)
         # fitness = (0.5 * performance + 0.3 * relevance -
         #            0.4 * redundancy - 0.3 * complexity_penalty)
-        fitness = (0.4 * performance + 0.3 * relevance - 0.2 * redundancy - 0.3 * complexity_penalty)
+        fitness = (0.6*recall + 0.4 * performance + 0.3 * relevance - 0.2 * redundancy - 0.3 * complexity_penalty)
         # 更新特征权重
         for idx in selected_idx:
             self.feature_weights[idx] += fitness
@@ -552,13 +563,13 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20):
     # 删除前三列标识信息列
     if data.shape[1] > 3:  # 确保有足够的列
         # 保留特征列（从第3列开始到倒数第二列）和目标列（最后一列）
-        feature_columns = data.columns[3:-1]
+        feature_columns = data.columns[:-1]
         target_column = data.columns[-1]
 
         X = data[feature_columns]
         y = data[target_column]
-    else:
-        raise ValueError("CSV文件列数不足，请检查数据格式")
+    # else:
+    #     raise ValueError("CSV文件列数不足，请检查数据格式")
 
     # 将目标变量转换为二分类：大于0表示有缺陷（1），等于0表示无缺陷（0）
     y = y.apply(lambda x: 1 if x > 0 else 0)
@@ -759,7 +770,7 @@ def DE_RASU_pipeline(file_path, target_column='bug', n_iter=30, pop_size=20):
 # ======================
 if __name__ == "__main__":
     # 从CSV文件加载真实数据
-    data_path = r"G:\pycharm\lutrs\de分层欠采样\datacunshu\arc.csv"  # 使用原始字符串
+    data_path = r"D:\-\de分层欠采样\datacunshu\Ivy-2.0.csv"  # 使用原始字符串
 
     # 运行DE-RASU管道
     results = DE_RASU_pipeline(file_path=data_path,

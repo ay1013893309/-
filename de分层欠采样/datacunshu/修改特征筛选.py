@@ -76,11 +76,11 @@ class RASUSampler:
         # 计算平均|SHAP|值作为重要性
         if isinstance(shap_values, list):
             # 对于分类问题，取正类的SHAP值
-            shap_abs = np.abs(shap_values[1])
+            shap_abs = shap_values[1]
         else:
-            shap_abs = np.abs(shap_values)
+            shap_abs = shap_values[0]
 
-        importance = np.mean(shap_abs[0], axis=0)
+        importance = np.abs(shap_abs).mean(axis=1)
         # # 使用随机森林计算特征重要性（修改点）
         # model = SVC(kernel='rbf', probability=True, random_state=42)
         # model.fit(X, y)
@@ -99,9 +99,27 @@ class RASUSampler:
         #     importance = max(0, baseline_score - reduced_score)  # 特征删除导致性能下降的程度
         #     self.feature_importance[feature] = importance
         # 归一化特征重要性
-        total = sum(self.feature_importance.values())
+        self.risk_features = [
+            feature for feature, imp in self.feature_importance.items()
+            if imp >= 0
+        ]
+        #
+        # 确保至少保留10个特征（防止过度筛选）
+        if len(self.risk_features) < 10:
+            # 按重要性排序并取前10个
+            sorted_features = sorted(self.feature_importance.items(),
+                                     key=lambda x: x[1], reverse=True)
+            self.risk_features = [feature for feature, _ in sorted_features[:10]]
+
+        print(f"Selected {len(self.risk_features)} features (from {len(X.columns)} total)")
+
+        # 更新数据，只保留筛选后的特征
+        self.data = self.data[self.risk_features + [self.target_name]]
+        # total = sum(self.feature_importance.values())
+        total = sum(self.feature_importance[feature] for feature in self.risk_features)
+
         if total > 0:
-            for feature in self.feature_importance:
+            for feature in self.risk_features:
                 self.feature_importance[feature] /= total
         else:
             # 如果所有重要性为零，则平均分配
@@ -309,7 +327,18 @@ def preprocess_data(X, y, visualize=True, save_dir="skewness_plots"):
     # 创建保存目录
     if visualize and not os.path.exists(save_dir):
         os.makedirs(save_dir)
+    # 1. 检查缺失比例
+    max_missing = 0.3
+    missing_ratio = X.isnull().mean()
 
+    # 2. 移除高缺失特征
+    high_missing = missing_ratio[missing_ratio > max_missing].index.tolist()
+    if high_missing:
+        print(f"Removing features with high missing ratio (> {max_missing:.0%}):")
+        for feature in high_missing:
+            ratio = missing_ratio[feature]
+            print(f"  {feature}: {ratio:.1%} missing")
+        X = X.drop(columns=high_missing)
     # 处理缺失值 - 使用中位数填充
     imputer = SimpleImputer(strategy='median')
     X_imputed = pd.DataFrame(imputer.fit_transform(X), columns=X.columns)
@@ -475,14 +504,44 @@ def plot_metrics_comparison(metrics, save_path=None):
     plt.show()
 
 
-def rasu_only_evaluation(file_path, target_column='bug', n_runs=5):
+def light_feature_selection(X, feature_importance, threshold=0.0):
+    """
+    轻度特征筛选：移除重要性低于阈值的特征
+
+    参数:
+    X: 特征DataFrame
+    feature_importance: 特征重要性字典
+    threshold: 重要性阈值（默认0.01）
+
+    返回:
+    筛选后的特征DataFrame
+    保留的特征列表
+    """
+    # 筛选重要性高于阈值的特征
+    selected_features = [feature for feature, imp in feature_importance.items() if imp >= threshold]
+
+    # 确保至少保留5个特征
+    if len(selected_features) < 5:
+        # 按重要性排序并取前5个
+        sorted_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)
+        selected_features = [feature for feature, _ in sorted_features[:5]]
+        print(f"Warning: Few features selected. Keeping top 5 features.")
+
+    print(f"\nSelected {len(selected_features)} features after light feature selection:")
+    print(selected_features)
+
+    return X[selected_features], selected_features
+
+
+def rasu_only_evaluation(file_path, target_column='bug', n_folds=5):
     """
     仅应用风险感知分层欠采样(RASU)的评估
+    添加轻度特征筛选：移除重要性<0.01的特征
 
     参数:
     file_path: CSV文件路径
     target_column: 目标列名称
-    n_runs: 重复实验次数
+    n_folds: 交叉验证折数
     """
     # 1. 从CSV文件加载数据
     print(f"Loading data from {file_path}...")
@@ -495,12 +554,10 @@ def rasu_only_evaluation(file_path, target_column='bug', n_runs=5):
 
     # 删除前三列标识信息列
     if data.shape[1] > 3:
-        feature_columns = data.columns[3:-1]
+        feature_columns = data.columns[:-1]
         target_column = data.columns[-1]
         X = data[feature_columns]
         y = data[target_column]
-    # else:
-    #     raise ValueError("CSV文件列数不足，请检查数据格式")
 
     # 将目标变量转换为二分类：大于0表示有缺陷（1），等于0表示无缺陷（0）
     y = y.apply(lambda x: 1 if x > 0 else 0)
@@ -527,9 +584,10 @@ def rasu_only_evaluation(file_path, target_column='bug', n_runs=5):
     X_preprocessed, y = preprocess_data(
         X,
         y,
-        visualize=True,  # 启用可视化
-        save_dir="skewness_plots"  # 指定保存目录
+        visualize=True,
+        save_dir="skewness_plots"
     )
+
     # 存储结果
     all_metrics = {
         'Precision': [],
@@ -543,24 +601,24 @@ def rasu_only_evaluation(file_path, target_column='bug', n_runs=5):
     # 存储采样信息
     sampling_ratios = []
 
-    print(f"\nStarting RASU Sampling evaluation with {n_runs} runs...")
-    for run in range(n_runs):
-        print(f"\n=== Run {run + 1}/{n_runs} ===")
+    # 存储特征选择信息
+    selected_features_list = []
 
-        # 使用不同的随机种子确保结果可重复
-        random_state = 42 + run
+    print(f"\nStarting RASU Sampling evaluation with {n_folds}-fold cross-validation...")
 
-        # 分割数据集 (80% 训练, 20% 测试)
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_preprocessed, y,
-            test_size=0.2,
-            stratify=y,
-            random_state=random_state
-        )
+    # 创建分层五折交叉验证器
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+    for fold_idx, (train_index, test_index) in enumerate(skf.split(X_preprocessed, y)):
+        print(f"\n=== Fold {fold_idx + 1}/{n_folds} ===")
+
+        # 分割数据集
+        X_train, X_test = X_preprocessed.iloc[train_index], X_preprocessed.iloc[test_index]
+        y_train, y_test = y.iloc[train_index], y.iloc[test_index]
 
         # 检查目标列是否有足够的类别
         if len(np.unique(y_train)) < 2:
-            print("Warning: Only one class present in training data. Skipping run.")
+            print("Warning: Only one class present in training data. Skipping fold.")
             continue
 
         # 3. 应用风险感知分层欠采样(RASU)
@@ -581,38 +639,51 @@ def rasu_only_evaluation(file_path, target_column='bug', n_runs=5):
         sampling_ratio = majority_count / minority_count if minority_count > 0 else 0
         sampling_ratios.append(sampling_ratio)
 
+        # 4. 轻度特征筛选
+        print("Performing light feature selection...")
+        # 获取特征重要性
+        feature_importance = rasu.feature_importance
+
+        # 进行轻度特征筛选
+        X_bal_selected, selected_features = light_feature_selection(X_bal, feature_importance, threshold =0.01)
+
+        # 存储特征选择信息（用于第一次运行的可视化）
+        if fold_idx == 0:
+            selected_features_list = selected_features
+
         # 可视化采样后的类分布 (仅第一次运行时)
-        if run == 0:
+        if fold_idx == 0:
             plot_class_distribution(y_bal, "(After RASU Sampling)", "rasu_class_distribution_balanced.png")
-            #
-            # # 可视化特征分布变化 (前3个特征)
-            # for i, feature in enumerate(X_bal.columns[:min(3, len(X_bal.columns))]):
-            #     rasu.plot_distribution_comparison(
-            #         pd.DataFrame(X_train, columns=X_preprocessed.columns),
-            #         X_bal,
-            #         feature,
-            #         f"rasu_distribution_{feature}.png"
-            #     )
 
-        # 4. 在采样数据上训练模型
-        print("Training model on RASU-sampled data...")
-        model = RandomForestClassifier(
-            n_estimators=100,
-            random_state=random_state,
-            n_jobs=-1
+        # 5. 在采样和筛选后的数据上训练模型
+        print(f"Training model on RASU-sampled and feature-selected data ({len(selected_features)} features)...")
+        # model = RandomForestClassifier(
+        #     n_estimators=100,
+        #     random_state=42,
+        #     n_jobs=-1
+        # )
+        model = KNeighborsClassifier(
+            n_neighbors=5,  # 选择5个最近邻（默认值）
+            # weights='uniform',  # 所有邻居权重相等
+            # algorithm='auto',  # 自动选择最优算法（KDTree/BallTree/Brute）
+            # leaf_size=30,  # 树结构叶子节点大小
+            # p=2,  # 欧氏距离（p=2）
+            # metric='minkowski',  # 闵可夫斯基距离（p=2时等价欧氏距离）
+            n_jobs=-1  # 使用所有CPU核心并行计算
         )
-        model.fit(X_bal, y_bal)
+        model.fit(X_bal_selected, y_bal)
 
-        # 5. 评估模型
-        metrics = evaluate_model(model, X_test, y_test)
+        # 6. 评估模型（使用原始测试集特征，但应用相同的特征筛选）
+        X_test_selected = X_test[selected_features]
+        metrics = evaluate_model(model, X_test_selected, y_test)
 
         # 保存指标
         for key in all_metrics:
             if key in metrics:
                 all_metrics[key].append(metrics[key])
 
-        # 6. 可视化结果 (仅第一次运行时)
-        if run == 0:
+        # 7. 可视化结果 (仅第一次运行时)
+        if fold_idx == 0:
             # 绘制混淆矩阵
             plot_confusion_matrix(metrics['confusion_matrix'], "(RASU Sampling)", "rasu_confusion_matrix.png")
 
@@ -621,8 +692,8 @@ def rasu_only_evaluation(file_path, target_column='bug', n_runs=5):
 
             # 计算特征重要性
             feature_importances = pd.DataFrame({
-                'Feature': X_bal.columns,
-                'Importance': model.feature_importances_
+                'Feature': selected_features,
+                'Importance': model.weights
             }).sort_values('Importance', ascending=False)
 
             # 可视化前15个重要特征
@@ -635,9 +706,43 @@ def rasu_only_evaluation(file_path, target_column='bug', n_runs=5):
                 palette='viridis',
                 legend=False
             )
-            plt.title('Feature Importance (RASU Sampling)')
+            plt.title('Feature Importance (After Selection)')
             plt.tight_layout()
             plt.savefig('rasu_feature_importance.png', dpi=300)
+            plt.show()
+
+            # 可视化特征筛选结果
+            plt.figure(figsize=(14, 8))
+
+            # 获取所有特征的重要性
+            all_features = list(feature_importance.keys())
+            all_importances = [feature_importance[feature] for feature in all_features]
+
+            # 排序特征
+            sorted_idx = np.argsort(all_importances)[::-1]
+            sorted_features = [all_features[i] for i in sorted_idx]
+            sorted_importances = [all_importances[i] for i in sorted_idx]
+
+            # 创建颜色映射：选中的特征为绿色，未选中的为灰色
+            colors = ['green' if feature in selected_features else 'gray' for feature in sorted_features]
+
+            # 绘制条形图
+            plt.bar(range(len(sorted_features)), sorted_importances, color=colors)
+            plt.axhline(y=0.01, color='r', linestyle='--', label='Threshold (0.01)')
+            plt.title('Feature Importance and Selection')
+            plt.xlabel('Features')
+            plt.ylabel('Importance')
+            plt.xticks(range(len(sorted_features)), sorted_features, rotation=90)
+            plt.legend()
+
+            # 添加计数标签
+            selected_count = len(selected_features)
+            total_count = len(all_features)
+            plt.text(0.05, 0.95, f"Selected: {selected_count}/{total_count} features",
+                     transform=plt.gca().transAxes, fontsize=12)
+
+            plt.tight_layout()
+            plt.savefig('feature_selection_result.png', dpi=300)
             plt.show()
 
     # 计算平均指标
@@ -655,7 +760,7 @@ def rasu_only_evaluation(file_path, target_column='bug', n_runs=5):
     print("RASU Sampling Evaluation Results")
     print("=" * 80)
     print(f"Dataset: {file_path}")
-    print(f"Total runs: {n_runs}")
+    print(f"Total folds: {n_folds}")
 
     # 性能指标摘要
     print("\nPerformance Metrics Summary:")
@@ -678,9 +783,9 @@ def rasu_only_evaluation(file_path, target_column='bug', n_runs=5):
 
     for i, metric in enumerate(metrics_to_plot):
         plt.subplot(2, 2, i + 1)
-        plt.plot(range(1, n_runs + 1), all_metrics[metric], 'o-', linewidth=2)
-        plt.title(f'{metric} over Runs')
-        plt.xlabel('Run')
+        plt.plot(range(1, n_folds + 1), all_metrics[metric], 'o-', linewidth=2)
+        plt.title(f'{metric} over Folds')
+        plt.xlabel('Fold')
         plt.ylabel(metric)
         plt.ylim(0, 1)
         plt.grid(True)
@@ -691,7 +796,7 @@ def rasu_only_evaluation(file_path, target_column='bug', n_runs=5):
         plt.text(0.5, avg + 0.02, f'Avg: {avg:.4f}', color='r')
 
     plt.tight_layout()
-    plt.savefig('rasu_performance_over_runs.png', dpi=300)
+    plt.savefig('rasu_performance_over_folds.png', dpi=300)
     plt.show()
 
     return {
@@ -710,7 +815,7 @@ if __name__ == "__main__":
     # 运行仅RASU采样评估
     results = rasu_only_evaluation(
         file_path=data_path,
-        n_runs=5
+        n_folds=5
     )
 
     if results:
